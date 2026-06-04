@@ -3,7 +3,12 @@
 // מקבל מהדפדפן או URL (קישור) או imageBase64 (צילום מסך),
 // מריץ בדיקת גיל-דומיין (RDAP) + ניתוח Gemini, ומחזיר פסק רמזור בעברית.
 
-const GEMINI_MODEL = "gemini-2.0-flash"; // אפשר להחליף לדגם הפלאש העדכני שאתה עובד איתו
+// Gemini 2.0 Flash הוצא משימוש / נחסם בחלק מהמפתחות, ולכן משתמשים במודל עדכני עם fallback.
+const GEMINI_MODELS = Array.from(new Set([
+  process.env.GEMINI_MODEL || "gemini-2.5-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-flash-latest",
+].filter(Boolean)));
 
 // ---------- prompts ----------
 function urlPrompt(domain, ageDays, pageText) {
@@ -179,20 +184,37 @@ async function fetchPageText(url) {
 
 // ---------- Gemini ----------
 async function callGemini(parts, key) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
-  const r = await withTimeout(fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts }],
-      generationConfig: { temperature: 0.2, maxOutputTokens: 700 },
-    }),
-  }), 25000);
-  if (!r.ok) throw new Error(`Gemini ${r.status}`);
-  const data = await r.json();
-  const text = (data.candidates?.[0]?.content?.parts || [])
-    .map((p) => p.text || "").join("").trim();
-  return safeJson(text);
+  let lastError = null;
+
+  for (const model of GEMINI_MODELS) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
+
+    try {
+      const r = await withTimeout(fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts }],
+          generationConfig: { temperature: 0.2, maxOutputTokens: 700 },
+        }),
+      }), 25000);
+
+      if (!r.ok) {
+        const errText = await r.text().catch(() => "");
+        lastError = `Gemini ${r.status} on ${model}: ${errText.slice(0, 250)}`;
+        continue;
+      }
+
+      const data = await r.json();
+      const text = (data.candidates?.[0]?.content?.parts || [])
+        .map((p) => p.text || "").join("").trim();
+      return safeJson(text);
+    } catch (e) {
+      lastError = `Gemini failed on ${model}: ${String((e && e.message) || e)}`;
+    }
+  }
+
+  throw new Error(lastError || "Gemini failed");
 }
 
 // ---------- utils ----------
