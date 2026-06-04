@@ -1,14 +1,29 @@
 // netlify/functions/check.js
-// "בודק קניות" — המוח של הכלי.
-// מקבל מהדפדפן או URL (קישור) או imageBase64 (צילום מסך),
-// מריץ בדיקת גיל-דומיין (RDAP) + ניתוח Gemini, ומחזיר פסק רמזור בעברית.
+// "בודק קניות" — מנוע בדיקה שמעדיף עובדות קשיחות לפני שיפוט AI:
+// Safe Browsing, גיל דומיין, whitelist וזיהוי התחזות. לאחר מכן Gemini משלים את ההקשר.
 
-// Gemini 2.0 Flash הוצא משימוש / נחסם בחלק מהמפתחות, ולכן משתמשים במודל עדכני עם fallback.
-const GEMINI_MODELS = Array.from(new Set([
-  process.env.GEMINI_MODEL || "gemini-2.5-flash-lite",
-  "gemini-2.5-flash",
-  "gemini-flash-latest",
-].filter(Boolean)));
+// לא להשתמש במודל 2.0. הוא מיועד להחלפה ועלול להחזיר Gemini 404.
+const GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash"];
+
+// ---------- אתרים מוכרים ובטוחים יחסית ----------
+// הוסף כאן אתרים שאבא באמת קונה בהם. אתר ברשימה לא ייצבע אדום רק בגלל חוסר מידע טכני.
+const TRUSTED = [
+  "ksp.co.il", "ivory.co.il", "terminalx.com", "shufersal.co.il", "rami-levy.co.il",
+  "zap.co.il", "lastprice.co.il", "payngo.co.il", "bug.co.il", "mahsaney-hashuk.co.il",
+  "amazon.com", "ebay.com", "aliexpress.com", "apple.com", "asos.com",
+];
+
+// ---------- מותגים שמתחזים אליהם ----------
+// אם הכתובת מכילה את ה-token אבל אינה האתר הרשמי, יש חשד להתחזות.
+const BRANDS = [
+  { token: "ksp", official: "ksp.co.il" },
+  { token: "terminalx", official: "terminalx.com" },
+  { token: "ivory", official: "ivory.co.il" },
+  { token: "shufersal", official: "shufersal.co.il" },
+  { token: "lastprice", official: "lastprice.co.il" },
+  { token: "payngo", official: "payngo.co.il" },
+  { token: "bug", official: "bug.co.il" },
+];
 
 // ---------- prompts ----------
 function urlPrompt(domain, ageDays, pageText) {
@@ -20,12 +35,13 @@ function urlPrompt(domain, ageDays, pageText) {
 - גיל הדומיין בימים: ${ageDays == null ? "לא ידוע" : ageDays}
 - תוכן הדף (חלקי): ${pageText ? pageText.slice(0, 4000) : "לא הצלחנו לקרוא את תוכן הדף"}
 
-חפש דגלי אזהרה: הנחות לא הגיוניות, לחץ של זמן או מלאי, בקשת תשלום בהעברה בנקאית / קריפטו / גיפט-קארד, היעדר ח.פ או כתובת או טלפון, עברית עילגת או מתורגמת במכונה, התחזות למותג מוכר (דומיין שדומה לשם מותג אך אינו הרשמי).
+חפש דגלי אזהרה: הנחות לא הגיוניות, לחץ של זמן או מלאי, היעדר ח.פ/כתובת/טלפון, עברית עילגת או מתורגמת, התחזות למותג מוכר.
+לגבי תשלום — שים לב לדיוק: בקשת כרטיס אשראי כשלעצמה אינה סימן לביטחון. הדגל האדום הוא דחיפה לתשלום בדרך שלא ניתן לבטל: העברה בנקאית, Bit, PayBox, גיפט-קארד או קריפטו. גם מסירת פרטי אשראי לאתר חדש ולא מוכר היא סיכון.
 
 החזר JSON במבנה הבא בדיוק:
 {"verdict":"red|yellow|green","headline":"משפט קצר אחד בעברית פשוטה","reasons":["סיבה 1","סיבה 2"],"action":"משפט אחד: מה לעשות עכשיו"}
 
-כללים: verdict=red אם יש סימן ברור להונאה; yellow אם יש ספק או חוסר מידע; green אם נראה תקין ומוכר. 2 עד 3 סיבות בלבד, כל אחת משפט קצר. דבר בעברית רגועה ופשוטה, בלי להפחיד יתר על המידה.`;
+כללים: verdict=red אם יש סימן ברור להונאה; yellow אם יש ספק או חוסר מידע; green אם נראה תקין ומוכר. 2 עד 3 סיבות בלבד, כל אחת משפט קצר. עברית רגועה ופשוטה, בלי להפחיד יתר על המידה.`;
 }
 
 function imagePrompt() {
@@ -54,10 +70,11 @@ function imagePrompt() {
 
 // ---------- handler ----------
 exports.handler = async (event) => {
-  if (event.httpMethod === "OPTIONS") return resp(204, {});
+  if (event.httpMethod === "OPTIONS") return resp(204, null);
   if (event.httpMethod !== "POST") return resp(405, { error: "Method not allowed" });
 
   const KEY = process.env.GEMINI_API_KEY;
+  const SB_KEY = process.env.SAFE_BROWSING_KEY || "";
   if (!KEY) return resp(500, { error: "חסר GEMINI_API_KEY בהגדרות הסביבה של Netlify" });
 
   let body;
@@ -65,8 +82,8 @@ exports.handler = async (event) => {
   catch { return resp(400, { error: "בקשה לא תקינה" }); }
 
   try {
-    if (body.imageBase64) return resp(200, await analyzeImage(body, KEY));
-    if (body.url)         return resp(200, await analyzeUrl(body.url, KEY));
+    if (body.imageBase64) return resp(200, await analyzeImage(body, KEY, SB_KEY));
+    if (body.url) return resp(200, await analyzeUrl(body.url, KEY, SB_KEY));
     return resp(400, { error: "צריך לשלוח url או imageBase64" });
   } catch (e) {
     return resp(500, { error: "שגיאה בבדיקה. נסה שוב.", detail: String((e && e.message) || e) });
@@ -74,52 +91,132 @@ exports.handler = async (event) => {
 };
 
 // ---------- url flow ----------
-async function analyzeUrl(rawUrl, key) {
-  const domain = extractDomain(rawUrl);
-  const [ageDays, pageText] = await Promise.all([rdapAgeDays(domain), fetchPageText(rawUrl)]);
+async function analyzeUrl(rawUrl, key, sbKey) {
+  const cleanUrl = normalizeUrl(rawUrl);
+  const domain = extractDomain(cleanUrl);
+  const hard = {
+    domain,
+    trusted: isWhitelisted(domain),
+    impersonation: impersonationOf(domain),
+  };
+
+  const [ageDays, sbThreat, pageText] = await Promise.all([
+    rdapAgeDays(domain).catch(() => null),
+    safeBrowsing(cleanUrl, sbKey).catch(() => null),
+    fetchPageText(cleanUrl).catch(() => null),
+  ]);
+
+  hard.ageDays = ageDays;
+  hard.sbThreat = sbThreat;
+
   const ai = await callGemini([{ text: urlPrompt(domain, ageDays, pageText) }], key);
-  return finalize(ai, { domain, ageDays });
+  return combine(hard, ai);
 }
 
 // ---------- image flow ----------
-async function analyzeImage({ imageBase64, mimeType }, key) {
+async function analyzeImage({ imageBase64, mimeType }, key, sbKey) {
   const ai = await callGemini([
     { text: imagePrompt() },
     { inline_data: { mime_type: mimeType || "image/jpeg", data: imageBase64 } },
   ], key);
 
-  let ageDays = null, domain = null;
+  const hard = { domain: null, trusted: false, impersonation: null, ageDays: null, sbThreat: null };
   if (ai.visibleUrl && /\./.test(ai.visibleUrl)) {
-    domain = extractDomain(ai.visibleUrl);
-    ageDays = await rdapAgeDays(domain).catch(() => null);
+    const cleanUrl = normalizeUrl(ai.visibleUrl);
+    hard.domain = extractDomain(cleanUrl);
+    hard.trusted = isWhitelisted(hard.domain);
+    hard.impersonation = impersonationOf(hard.domain);
+    const [ageDays, sbThreat] = await Promise.all([
+      rdapAgeDays(hard.domain).catch(() => null),
+      safeBrowsing(cleanUrl, sbKey).catch(() => null),
+    ]);
+    hard.ageDays = ageDays;
+    hard.sbThreat = sbThreat;
   }
-  return finalize(ai, { domain, ageDays });
+  return combine(hard, ai);
 }
 
-// ---------- combine AI verdict + hard domain-age signal ----------
-function finalize(ai, { domain, ageDays }) {
-  let verdict = ["red", "yellow", "green"].includes(ai.verdict) ? ai.verdict : "yellow";
-  const reasons = Array.isArray(ai.reasons) ? ai.reasons.slice(0, 3) : [];
+// ---------- שילוב: אות קשיח גובר על שיפוט AI ----------
+function combine(hard, ai) {
+  const aiVerdict = ["red", "yellow", "green"].includes(ai.verdict) ? ai.verdict : "yellow";
+  const aiReasons = Array.isArray(ai.reasons) ? ai.reasons : [];
+  const facts = [];
+  let verdict = null;
+  let hardOverride = false;
 
-  // גיל דומיין הוא אחד האותות החזקים ביותר — override קשיח
-  if (ageDays != null) {
-    if (ageDays < 14) {
-      verdict = "red";
-      reasons.unshift(`האתר נפתח לפני ${ageDays} ימים בלבד — סימן מובהק לאתר עוקץ.`);
-    } else if (ageDays < 60 && verdict === "green") {
-      verdict = "yellow";
-      reasons.unshift(`האתר נפתח רק לפני כחודשיים — כדאי להיזהר.`);
-    }
+  if (hard.sbThreat) {
+    verdict = "red";
+    hardOverride = true;
+    facts.push("גוגל מסמנת את האתר הזה כאתר מסוכן או פישינג ידוע.");
   }
+
+  if (!verdict && hard.impersonation) {
+    verdict = "red";
+    hardOverride = true;
+    facts.push(`הכתובת דומה למותג "${hard.impersonation.brand}" אבל אינה האתר הרשמי (${hard.impersonation.official}).`);
+  }
+
+  if (!verdict && !hard.trusted && hard.ageDays != null && hard.ageDays < 14) {
+    verdict = "red";
+    hardOverride = true;
+    facts.push(`האתר נפתח לפני ${hard.ageDays} ימים בלבד — סימן אזהרה משמעותי.`);
+  }
+
+  if (!verdict && hard.trusted) {
+    verdict = "green";
+    hardOverride = true;
+    facts.push("הכתובת שייכת לאתר מוכר ומבוסס.");
+  }
+
+  if (!verdict) {
+    verdict = aiVerdict;
+  } else if (hard.trusted && verdict === "green" && aiVerdict === "red") {
+    verdict = "yellow";
+    hardOverride = true;
+    facts.push("למרות שמדובר באתר מוכר, נמצא פרט חריג שמצדיק בדיקה לפני תשלום.");
+  }
+
+  if (verdict !== "red" && !hard.trusted && hard.ageDays != null && hard.ageDays >= 14 && hard.ageDays < 60) {
+    if (verdict === "green") verdict = "yellow";
+    facts.push("האתר נפתח רק לאחרונה — כדאי להיזהר לפני שמזינים פרטי תשלום.");
+  }
+
+  const reasons = uniqueShort([...facts, ...aiReasons], 3);
 
   return {
     verdict,
-    headline: ai.headline || defaultHeadline(verdict),
-    reasons: reasons.slice(0, 3),
-    action: ai.action || defaultAction(verdict),
-    domain: domain || null,
-    domainAgeDays: ageDays,
+    headline: chooseHeadline(verdict, hard, ai, hardOverride),
+    reasons,
+    action: chooseAction(verdict, hard, ai, hardOverride),
+    domain: hard.domain || null,
+    domainAgeDays: hard.ageDays,
+    trusted: !!hard.trusted,
   };
+}
+
+function uniqueShort(items, max) {
+  const out = [];
+  for (const item of items) {
+    const s = String(item || "").trim();
+    if (s && !out.includes(s)) out.push(s);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function chooseHeadline(v, hard, ai, hardOverride) {
+  if (hard.sbThreat) return "זהירות — האתר מסומן כמסוכן";
+  if (hard.impersonation) return "זהירות — ייתכן שמדובר בהתחזות";
+  if (hard.trusted && v === "green") return "האתר מוכר, עדיין קונים בזהירות";
+  if (hardOverride) return defaultHeadline(v);
+  return ai.headline || defaultHeadline(v);
+}
+
+function chooseAction(v, hard, ai, hardOverride) {
+  if (v === "red") return "אל תשלם. סגור את הדף ושלח לבן משפחה לבדיקה.";
+  if (hard.trusted && v === "green") return "ודא שהכתובת בשורת הכתובת נכונה, ושלם רק באמצעי תשלום מוגן ולא בהעברה לאדם פרטי.";
+  if (hardOverride) return defaultAction(v);
+  return ai.action || defaultAction(v);
 }
 
 function defaultHeadline(v) {
@@ -127,16 +224,52 @@ function defaultHeadline(v) {
        : v === "yellow" ? "כדאי לבדוק לפני שקונים"
        : "לא נמצאו סימני אזהרה";
 }
+
 function defaultAction(v) {
   return v === "red" ? "אל תשלם. סגור את הדף ושלח לבן המשפחה לבדיקה."
-       : v === "yellow" ? "אל תמהר. שלח לבן המשפחה לפני שאתה משלם."
-       : "נראה בסדר, אבל תמיד שלם רק בכרטיס אשראי.";
+       : v === "yellow" ? "אל תמהר. שלח לבן משפחה לפני שאתה משלם."
+       : "נראה בסדר. שלם רק באמצעי תשלום מוגן ולא בהעברה או Bit לאדם פרטי.";
+}
+
+// ---------- whitelist / impersonation ----------
+function isWhitelisted(domain) {
+  if (!domain) return false;
+  return TRUSTED.some((w) => domain === w || domain.endsWith("." + w));
+}
+
+function impersonationOf(domain) {
+  if (!domain) return null;
+  for (const b of BRANDS) {
+    const isOfficial = domain === b.official || domain.endsWith("." + b.official);
+    if (!isOfficial && domain.includes(b.token)) return { brand: b.token, official: b.official };
+  }
+  return null;
+}
+
+// ---------- Google Safe Browsing ----------
+async function safeBrowsing(url, key) {
+  if (!key) return null;
+  const r = await fetchWithTimeout(`https://safebrowsing.googleapis.com/v4/threatMatches:find?key=${key}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      client: { clientId: "buy-check", clientVersion: "1.0" },
+      threatInfo: {
+        threatTypes: ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
+        platformTypes: ["ANY_PLATFORM"],
+        threatEntryTypes: ["URL"],
+        threatEntries: [{ url }],
+      },
+    }),
+  }, 7000);
+  if (!r.ok) return null;
+  const j = await r.json();
+  return (j.matches && j.matches.length) ? j.matches[0].threatType : null;
 }
 
 // ---------- RDAP: גיל הדומיין בימים ----------
 async function rdapAgeDays(domain) {
   if (!domain) return null;
-  // מנסה מהשם המלא ומקצר שכבה־שכבה (מטפל בתתי־דומיין ובסיומות כמו co.il)
   const labels = domain.split(".");
   for (let i = 0; i <= labels.length - 2; i++) {
     const cand = labels.slice(i).join(".");
@@ -152,9 +285,9 @@ async function rdapAgeDays(domain) {
 }
 
 async function rdapRegistrationDate(domain) {
-  const r = await withTimeout(fetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, {
+  const r = await fetchWithTimeout(`https://rdap.org/domain/${encodeURIComponent(domain)}`, {
     headers: { accept: "application/rdap+json" },
-  }), 7000);
+  }, 7000);
   if (!r.ok) return null;
   const j = await r.json();
   const ev = (j.events || []).find((e) => e.eventAction === "registration");
@@ -164,10 +297,10 @@ async function rdapRegistrationDate(domain) {
 // ---------- best-effort קריאת תוכן הדף ----------
 async function fetchPageText(url) {
   try {
-    const r = await withTimeout(fetch(url, {
+    const r = await fetchWithTimeout(url, {
       redirect: "follow",
       headers: { "user-agent": "Mozilla/5.0 (compatible; SafeBuyCheck/1.0)" },
-    }), 7000);
+    }, 7000);
     if (!r.ok) return null;
     const html = await r.text();
     return html
@@ -185,64 +318,71 @@ async function fetchPageText(url) {
 // ---------- Gemini ----------
 async function callGemini(parts, key) {
   let lastError = null;
-
   for (const model of GEMINI_MODELS) {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
-
     try {
-      const r = await withTimeout(fetch(url, {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
+      const r = await fetchWithTimeout(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           contents: [{ role: "user", parts }],
-          generationConfig: { temperature: 0.2, maxOutputTokens: 700 },
+          generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: 700,
+            responseMimeType: "application/json",
+          },
         }),
-      }), 25000);
-
-      if (!r.ok) {
-        const errText = await r.text().catch(() => "");
-        lastError = `Gemini ${r.status} on ${model}: ${errText.slice(0, 250)}`;
-        continue;
-      }
-
+      }, 25000);
+      if (!r.ok) throw new Error(`Gemini ${model} ${r.status}`);
       const data = await r.json();
-      const text = (data.candidates?.[0]?.content?.parts || [])
-        .map((p) => p.text || "").join("").trim();
+      const text = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
       return safeJson(text);
     } catch (e) {
-      lastError = `Gemini failed on ${model}: ${String((e && e.message) || e)}`;
+      lastError = e;
     }
   }
-
-  throw new Error(lastError || "Gemini failed");
+  throw lastError || new Error("Gemini failed");
 }
 
 // ---------- utils ----------
+function normalizeUrl(u) {
+  const s = String(u || "").trim();
+  if (!s) return "";
+  return /^https?:\/\//i.test(s) ? s : "https://" + s;
+}
+
 function extractDomain(u) {
   try {
-    const withScheme = /^https?:\/\//i.test(u) ? u : "https://" + u;
-    return new URL(withScheme).hostname.replace(/^www\./i, "").toLowerCase();
+    return new URL(normalizeUrl(u)).hostname.replace(/^www\./i, "").toLowerCase();
   } catch (_) {
     return String(u).replace(/^https?:\/\//i, "").replace(/^www\./i, "").split(/[/?#]/)[0].toLowerCase();
   }
 }
 
 function safeJson(text) {
-  let t = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+  let t = String(text || "").replace(/```json/gi, "").replace(/```/g, "").trim();
   const a = t.indexOf("{"), b = t.lastIndexOf("}");
   if (a !== -1 && b !== -1) t = t.slice(a, b + 1);
   try { return JSON.parse(t); }
-  catch { return { verdict: "yellow", headline: "לא הצלחנו לנתח עד הסוף", reasons: ["נסה שוב, או שלח לבן המשפחה."], action: "אל תשלם עד שתקבל אישור.", visibleUrl: "" }; }
+  catch {
+    return {
+      verdict: "yellow",
+      headline: "לא הצלחנו לנתח עד הסוף",
+      reasons: ["נסה שוב, או שלח לבן משפחה לבדיקה."],
+      action: "אל תשלם עד שתקבל אישור.",
+      visibleUrl: "",
+    };
+  }
 }
 
-function withTimeout(promise, ms) {
+async function fetchWithTimeout(url, options, ms) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), ms);
-  // fetch לא תמיד מקבל signal דרך ה-promise הזה; נשתמש ב-race כגיבוי
-  return Promise.race([
-    promise,
-    new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms)),
-  ]).finally(() => clearTimeout(t));
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 function resp(status, obj) {
@@ -254,6 +394,6 @@ function resp(status, obj) {
       "access-control-allow-headers": "content-type",
       "access-control-allow-methods": "POST, OPTIONS",
     },
-    body: JSON.stringify(obj),
+    body: obj == null ? "" : JSON.stringify(obj),
   };
 }

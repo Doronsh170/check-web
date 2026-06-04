@@ -243,7 +243,11 @@
 
     const act = $("action");
     act.className = "action " + conf.acls;
-    act.innerHTML = "<b>מה לעשות עכשיו:</b> " + (d.action || "");
+    act.textContent = "";
+    const actionLabel = document.createElement("b");
+    actionLabel.textContent = "מה לעשות עכשיו:";
+    act.appendChild(actionLabel);
+    act.appendChild(document.createTextNode(" " + (d.action || "")));
 
     // וואטסאפ
     const lines = [
